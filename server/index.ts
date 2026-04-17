@@ -1,164 +1,279 @@
-type ClientData = {
-    username?: string;
-    room_id?: string;
-    board?: { hasShip: boolean; shot: boolean }[][];
-};
-const roomTurns = new Map<string, string>(); // room_id -> username whose turn it is
-const playerBoards = new Map<string, { hasShip: boolean; shot: boolean }[][]>();
+// --- Types ---
+type Cell = { hasShip: boolean; shot: boolean };
+type Board = Cell[][];
 
+type ClientData = {
+    username: string;
+    room_id: string;
+};
+
+type Room = {
+    players: string[];                        // usernames in join order
+    boards: Map<string, Board>;               // username -> board
+    turn: string | null;                      // whose turn
+    phase: "waiting" | "playing" | "gameover"; // room state
+};
+
+// --- State ---
+const rooms = new Map<string, Room>();
+const playerSockets = new Map<string, any>(); // username -> ws (for direct sends)
+
+function getOrCreateRoom(room_id: string): Room {
+    let room = rooms.get(room_id);
+    if (!room) {
+        room = { players: [], boards: new Map(), turn: null, phase: "waiting" };
+        rooms.set(room_id, room);
+    }
+    return room;
+}
+
+// --- Server ---
 const server = Bun.serve<ClientData>({
     port: 3000,
 
-    fetch(request: { url: string | URL; }, server: { upgrade: (arg0: any, arg1: { data: { username: string; room_id: string; board: never[]; }; }) => any; }) {
+    fetch(request, server) {
         const url = new URL(request.url);
 
-        if(url.pathname === "/ws") {
-            // Handle WebSocket connection
-            const username = url.searchParams.get("username") ?? "Anonymous";
-            const room_id = url.searchParams.get("room_id") ?? "default-room";
+        if (url.pathname === "/ws") {
+            const username = url.searchParams.get("username")?.trim();
+            const room_id = url.searchParams.get("room_id")?.trim();
+
+            if (!username || !room_id) {
+                return new Response("Missing username or room_id", { status: 400 });
+            }
+
+            const room = getOrCreateRoom(room_id);
+            if (room.players.length >= 2 && !room.players.includes(username)) {
+                return new Response("Room is full", { status: 403 });
+            }
 
             const upgraded = server.upgrade(request, {
-                data: { username, room_id, board: [] }
+                data: { username, room_id },
             });
 
-            if(upgraded) return;
+            if (upgraded) return;
             return new Response("WebSocket upgrade failed", { status: 500 });
         }
 
-        return new Response("Bun WebSocket server is running");
+        return new Response("Battleship server running");
+    },
+
+    websocket: {
+        open(ws) {
+            const { username, room_id } = ws.data;
+            const channel = `room:${room_id}`;
+            const room = getOrCreateRoom(room_id);
+
+            // Track socket for direct messaging
+            playerSockets.set(username, ws);
+
+            // Add player to room if not already there
+            if (!room.players.includes(username)) {
+                room.players.push(username);
+            }
+
+            ws.subscribe(channel);
+
+            // Notify others
+            ws.publish(channel, JSON.stringify({
+                type: "system",
+                message: `${username} joined the room`,
+            }));
+
+            // Tell this player how many are in the room
+            ws.send(JSON.stringify({
+                type: "system",
+                message: `You joined room "${room_id}". Players: ${room.players.length}/2`,
+            }));
+
+            if (room.players.length < 2) {
+                ws.send(JSON.stringify({ type: "waiting", message: "Waiting for opponent..." }));
+            }
+
+            console.log(`${username} connected to room ${room_id} (${room.players.length}/2)`);
         },
 
-        websocket: {
-            open(ws: { data: { username: any; room_id: any; }; subscribe: (arg0: string) => void; publish: (arg0: string, arg1: string) => void; }) {
-                console.log(`${ws.data.username} connected to room ${ws.data.room_id}`);
-                const channel = `room:${ws.data.room_id}`;
-                
-                ws.subscribe(channel);
-
-                ws.publish(channel, JSON.stringify({
-                    type: "system",
-                    message: `${ws.data.username} joined the server`
-                }));
-            },
-            message(ws: { data: any; send: any; publish?: ((arg0: string, arg1: string) => void) | ((arg0: string, arg1: string) => void); }, message: string) {
-                let data;
-                const channel = `room:${ws.data.room_id}`;
-                try {
-                    data = JSON.parse(message);
-            // If this is the first player, set their turn
-            const players = Array.from(playerBoards.keys()).filter(u => u !== undefined);
-            if (players.length === 1) {
-                roomTurns.set(ws.data.room_id, ws.data.username);
+        message(ws, message) {
+            let data: any;
+            try {
+                data = JSON.parse(message as string);
+            } catch {
+                ws.send(JSON.stringify({ type: "error", message: "Invalid JSON" }));
+                return;
             }
-            // Notify both players whose turn it is
-            broadcastTurnUpdate(ws.data.room_id);
-                } catch (e) {
-                    console.error("Failed to parse message:", e);
-                    return;
-                }
-                switch(data.type) {
-                    case "attack":
-                    handleAttack(ws, data);
-                    break;
-                    case "boardSetup":
+
+            switch (data.type) {
+                case "boardSetup":
                     handleBoardSetup(ws, data);
                     break;
-                    default:
-                        ws.send(JSON.stringify({
-                            type: "error",
-                            message: "Unknown message type"
-                        }));
-                }
-
-            },
-            close(ws: { data: { room_id: any; username: any; }; publish: (arg0: string, arg1: string) => void; }) {
-                const channel = `room:${ws.data.room_id}`;
-                console.log(`${ws.data.username} disconnected`);
-                ws.publish(channel, JSON.stringify({
-                    type: "system",
-                    message: `${ws.data.username} disconnected`
-                }));
+                case "attack":
+                    handleAttack(ws, data);
+                    break;
+                default:
+                    ws.send(JSON.stringify({ type: "error", message: "Unknown message type" }));
             }
-        }
+        },
 
+        close(ws) {
+            const { username, room_id } = ws.data;
+            const channel = `room:${room_id}`;
+
+            playerSockets.delete(username);
+
+            const room = rooms.get(room_id);
+            if (room) {
+                room.players = room.players.filter((p) => p !== username);
+                room.boards.delete(username);
+                room.phase = "waiting";
+                room.turn = null;
+
+                if (room.players.length === 0) {
+                    rooms.delete(room_id);
+                }
+            }
+
+            ws.publish(channel, JSON.stringify({
+                type: "system",
+                message: `${username} disconnected`,
+            }));
+
+            // Notify remaining player
+            if (room && room.players.length === 1) {
+                const remaining = playerSockets.get(room.players[0]);
+                if (remaining) {
+                    remaining.send(JSON.stringify({
+                        type: "opponentDisconnected",
+                        message: "Your opponent disconnected. Waiting for a new player...",
+                    }));
+                }
+            }
+
+            console.log(`${username} disconnected from room ${room_id}`);
+        },
+    },
 });
 
-function broadcastTurnUpdate(room_id: string) {
-    const turn = roomTurns.get(room_id);
-    const channel = `room:${room_id}`;
-    server.publish(channel, JSON.stringify({
-        type: "turnUpdate",
-        turn
-    }));
-}
+// --- Handlers ---
+function handleBoardSetup(ws: any, data: { board: Board }) {
+    const { username, room_id } = ws.data;
+    const room = getOrCreateRoom(room_id);
 
-function handleAttack(ws: { data: { room_id: any; username: any; }; send: (arg0: string) => void; publish: (arg0: string, arg1: string) => void; }, data: { x: any; y: any; }) {
-        const channel = `room:${ws.data.room_id}`;
-        const attacker = ws.data.username;
-        const opponent = getOpponentUsername(ws.data.room_id, attacker);
-        if (!opponent) {
-            ws.send(JSON.stringify({
-                type: "error",
-                message: "No opponent found."
-            }));
-            return;
-        }
-        const board = playerBoards.get(opponent);
-        if (!board) {
-            ws.send(JSON.stringify({
-                type: "error",
-                message: "Opponent's board not found."
-            }));
-            return;
-        }
-        const { x, y } = data;
-        if (x < 0 || y < 0 || y >= board.length || x >= board[0].length) {
-            ws.send(JSON.stringify({
-                type: "error",
-                message: "Invalid attack coordinates."
-            }));
-            return;
-        }
-        const cell = board[y][x];
-        let result = "miss";
-        if (!cell.shot) {
-            cell.shot = true;
-            if (cell.hasShip) {
-                result = "hit";
-            }
-            // Save updated board
-            playerBoards.set(opponent, board);
-        } else {
-            result = "already";
-        }
-        ws.publish(channel, JSON.stringify({
-            type: "attackResult",
-            message: `${attacker} attacked (${x}, ${y}): ${result}`,
-            x,
-            y,
-            result
-        }));
-    }
-// Helper to get opponent username in a room (simple version: first other player found)
-    function getOpponentUsername(room_id: any, username: string) {
-        for (const [user, board] of playerBoards.entries()) {
-            if (user !== username) return user;
-        }
-        return null;
-    }
-function handleBoardSetup(ws: { data: { username: string; board: any; room_id: any; }; publish: (arg0: string, arg1: string) => void; }, data: { board: { hasShip: boolean; shot: boolean; }[][]; }) {
-        // Save the player's board by username
-        if (ws.data.username) {
-            playerBoards.set(ws.data.username, data.board);
-        }
-    ws.data.board = data.board;
-    const channel = `room:${ws.data.room_id}`;
-    
+    room.boards.set(username, data.board);
+
+    ws.send(JSON.stringify({ type: "system", message: "Your board is ready." }));
+
+    const channel = `room:${room_id}`;
     ws.publish(channel, JSON.stringify({
         type: "system",
-        message: `${ws.data.username} has set up their board`
+        message: `${username} is ready`,
     }));
+
+    // Check if both players have boards (game can start)
+    if (room.players.length === 2 && room.boards.size === 2) {
+        startGame(room_id);
+    }
 }
 
+function startGame(room_id: string) {
+    const room = rooms.get(room_id);
+    if (!room) return;
 
-console.log(`WebSocket server is running on ws://localhost:${server.port}/ws`);
+    room.phase = "playing";
+    room.turn = room.players[0]; // first player to join goes first
+
+    const channel = `room:${room_id}`;
+    server.publish(channel, JSON.stringify({
+        type: "gameStart",
+        message: "Both players ready. Game begins!",
+    }));
+
+    // Also send to both players directly (publish doesn't send to self)
+    for (const player of room.players) {
+        const sock = playerSockets.get(player);
+        if (sock) {
+            sock.send(JSON.stringify({ type: "gameStart", message: "Both players ready. Game begins!" }));
+            sock.send(JSON.stringify({ type: "turnUpdate", turn: room.turn }));
+        }
+    }
+}
+
+function handleAttack(ws: any, data: { x: number; y: number }) {
+    const { username, room_id } = ws.data;
+    const room = rooms.get(room_id);
+
+    if (!room || room.phase !== "playing") {
+        ws.send(JSON.stringify({ type: "error", message: "Game is not in progress." }));
+        return;
+    }
+
+    if (room.turn !== username) {
+        ws.send(JSON.stringify({ type: "error", message: "It's not your turn." }));
+        return;
+    }
+
+    const opponent = room.players.find((p) => p !== username);
+    if (!opponent) {
+        ws.send(JSON.stringify({ type: "error", message: "No opponent found." }));
+        return;
+    }
+
+    const board = room.boards.get(opponent);
+    if (!board) {
+        ws.send(JSON.stringify({ type: "error", message: "Opponent board not found." }));
+        return;
+    }
+
+    const { x, y } = data;
+    if (x < 0 || y < 0 || y >= board.length || x >= board[0].length) {
+        ws.send(JSON.stringify({ type: "error", message: "Invalid coordinates." }));
+        return;
+    }
+
+    const cell = board[y][x];
+    if (cell.shot) {
+        ws.send(JSON.stringify({ type: "error", message: "Already shot there." }));
+        return;
+    }
+
+    cell.shot = true;
+    const result = cell.hasShip ? "hit" : "miss";
+
+    // Send result to attacker
+    ws.send(JSON.stringify({ type: "attackResult", x, y, result }));
+
+    // Notify opponent that they were attacked
+    const opponentSocket = playerSockets.get(opponent);
+    if (opponentSocket) {
+        opponentSocket.send(JSON.stringify({ type: "opponentAttack", x, y, result }));
+    }
+
+    // Check win condition
+    if (checkWin(board)) {
+        room.phase = "gameover";
+        ws.send(JSON.stringify({ type: "gameOver", winner: username, message: "You win!" }));
+        if (opponentSocket) {
+            opponentSocket.send(JSON.stringify({ type: "gameOver", winner: username, message: "You lose!" }));
+        }
+        return;
+    }
+
+    // Switch turns
+    room.turn = opponent;
+    for (const player of room.players) {
+        const sock = playerSockets.get(player);
+        if (sock) {
+            sock.send(JSON.stringify({ type: "turnUpdate", turn: room.turn }));
+        }
+    }
+}
+
+function checkWin(board: Board): boolean {
+    for (const row of board) {
+        for (const cell of row) {
+            if (cell.hasShip && !cell.shot) return false;
+        }
+    }
+    return true;
+}
+
+console.log(`Battleship server running on ws://localhost:${server.port}/ws`);
