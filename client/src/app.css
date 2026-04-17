@@ -1,0 +1,33 @@
+.game {
+    display: flex;
+    flex-direction: column-reverse;
+}
+
+.board {
+  display: inline-grid;
+  gap: 2px;
+}
+
+.row {
+  display: flex;
+  gap: 2px;
+}
+
+.cell {
+  width: 40px;
+  height: 40px;
+  border: 1px solid #888;
+  background: #dbeafe;
+}
+
+.cell.ship {
+  background: #64748b;
+}
+
+.cell.hit {
+  background: #ef4444;
+}
+
+.cell.miss {
+  background: #93c5fd;
+}
