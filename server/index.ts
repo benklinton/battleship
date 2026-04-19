@@ -31,7 +31,7 @@ function getOrCreateRoom(room_id: string): Room {
 const server = Bun.serve<ClientData>({
     port: 3000,
 
-    fetch(request, server) {
+    fetch(request: any, server: any) {
         const url = new URL(request.url);
 
         if (url.pathname === "/ws") {
@@ -59,7 +59,7 @@ const server = Bun.serve<ClientData>({
     },
 
     websocket: {
-        open(ws) {
+        open(ws: any) {
             const { username, room_id } = ws.data;
             const channel = `room:${room_id}`;
             const room = getOrCreateRoom(room_id);
@@ -93,7 +93,7 @@ const server = Bun.serve<ClientData>({
             console.log(`${username} connected to room ${room_id} (${room.players.length}/2)`);
         },
 
-        message(ws, message) {
+        message(ws: any, message: any) {
             let data: any;
             try {
                 data = JSON.parse(message as string);
@@ -114,7 +114,7 @@ const server = Bun.serve<ClientData>({
             }
         },
 
-        close(ws) {
+        close(ws: any) {
             const { username, room_id } = ws.data;
             const channel = `room:${room_id}`;
 
