@@ -1,5 +1,6 @@
 {
-    "scripts": {
-        "start": "bun run --watch server/index.ts"
-    }
+  "dependencies": {},
+  "devDependencies": {
+    "@types/bun": "^1.3.12"
+  }
 }
